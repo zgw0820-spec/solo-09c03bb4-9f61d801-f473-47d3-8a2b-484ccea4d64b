@@ -5,6 +5,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY dnsnode /app/dnsnode
+COPY common /app/common
 
 EXPOSE 5353/udp 8053
 CMD ["python", "-m", "dnsnode.node"]

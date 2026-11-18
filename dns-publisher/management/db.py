@@ -20,6 +20,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterable
 
+from common import sigauth
+
 DB_PATH = os.environ.get("MGMT_DB_PATH", "/data/management.db")
 # A node that has not reported within this many seconds is considered offline.
 OFFLINE_AFTER = float(os.environ.get("OFFLINE_AFTER_SECONDS", "15"))
@@ -70,6 +72,8 @@ def init_db() -> None:
                 );
                 """
             )
+            # 节点回传的防重放 nonce 表（持久化，重启后重放仍被拒绝）
+            conn.executescript(sigauth.REPLAY_TABLE_DDL)
         _initialised = True
 
 

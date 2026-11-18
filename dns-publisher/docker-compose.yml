@@ -11,6 +11,13 @@ services:
       MGMT_DB_PATH: /data/management.db
       OFFLINE_AFTER_SECONDS: "15"
       RECONCILE_INTERVAL: "3"
+      # 运维令牌：/publishes 与 /reconcile 需 "Authorization: Bearer <token>"。
+      # 生产部署务必替换。
+      OPS_TOKEN: "dev-ops-token-change-me"
+      # 每个节点一把 HMAC 密钥（JSON: node_id -> key），与节点侧 NODE_KEY 对应。
+      # 生产部署务必替换并保密分发。
+      NODE_KEYS: '{"node-a":"dev-node-a-key-change-me","node-b":"dev-node-b-key-change-me"}'
+      SIG_TTL_SECONDS: "300"
       NODES: >-
         [
           {"id":"node-a","control_url":"http://node-a:8053","dns_host":"node-a","dns_port":5353},
@@ -36,6 +43,8 @@ services:
       NODE_ID: node-a
       NODE_DB_PATH: /data/node.db
       MGMT_BASE_URL: http://mgmt:8000
+      NODE_KEY: "dev-node-a-key-change-me"
+      SIG_TTL_SECONDS: "300"
       UDP_PORT: "5353"
       HTTP_PORT: "8053"
       HEARTBEAT_INTERVAL: "5"
@@ -54,6 +63,8 @@ services:
       NODE_ID: node-b
       NODE_DB_PATH: /data/node.db
       MGMT_BASE_URL: http://mgmt:8000
+      NODE_KEY: "dev-node-b-key-change-me"
+      SIG_TTL_SECONDS: "300"
       UDP_PORT: "5353"
       HTTP_PORT: "8053"
       HEARTBEAT_INTERVAL: "5"

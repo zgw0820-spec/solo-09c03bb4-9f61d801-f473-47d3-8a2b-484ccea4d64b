@@ -3,9 +3,16 @@
 Responsibilities
 ----------------
 * Accept address-list submissions (Swagger / OpenAPI at ``/docs``) and turn
-  each one into a new strictly increasing revision in SQLite.
+  each one into a new strictly increasing revision in SQLite. ``POST
+  /publishes`` (and the ops action ``POST /reconcile``) require the ops
+  bearer token (``OPS_TOKEN``).
 * Push every revision to both independent DNS nodes and keep reconciling
-  until each node serves the newest revision.
+  until each node serves the newest revision. Every push is HMAC-signed with
+  the *target node's* key, binding node identity, revision and the complete
+  address set, with timestamp + nonce (see ``common.sigauth``).
+* Accept node heartbeats / served-revision reports only with a valid
+  per-node signature; unsigned, expired, cross-node or replayed callbacks
+  cannot forge online state or sync conclusions.
 * Report per-node served revision, online/offline state and catch-up status,
   and an aggregate conclusion that can *never* read "synced" while a node is
   offline or behind.
@@ -14,6 +21,7 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -23,8 +31,11 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from dnslib import QTYPE, RCODE, DNSRecord
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
+
+from common import sigauth
 
 from . import db
 
@@ -51,6 +62,34 @@ NODES: list[dict[str, Any]] = _load_nodes()
 NODE_IDS = [n["id"] for n in NODES]
 RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "3"))
 PUSH_TIMEOUT = float(os.environ.get("PUSH_TIMEOUT", "4"))
+
+# --------------------------------------------------------------------------- #
+# 发布链路授权配置
+# --------------------------------------------------------------------------- #
+# 运维令牌：/publishes 与 /reconcile 必须携带 "Authorization: Bearer <token>"。
+OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
+# 每个节点一把 HMAC 密钥：管理端持有全集，节点只持有自己的一把。
+NODE_KEYS: dict[str, str] = json.loads(os.environ.get("NODE_KEYS", "{}"))
+# 签名时间戳允许的最大偏差（秒）；超时请求一律拒绝。
+SIG_TTL = float(os.environ.get("SIG_TTL_SECONDS", str(sigauth.DEFAULT_TTL_SECONDS)))
+
+_bearer = HTTPBearer(auto_error=False, description="运维令牌（OPS_TOKEN）")
+
+
+def require_ops_token(
+    creds: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> None:
+    """写操作（/publishes、/reconcile）的运维令牌校验，未配置时拒绝服务。"""
+    if not OPS_TOKEN:
+        raise HTTPException(503, "服务端未配置 OPS_TOKEN，写接口不可用")
+    if (
+        creds is None
+        or creds.scheme.lower() != "bearer"
+        or not hmac.compare_digest(creds.credentials.encode(), OPS_TOKEN.encode())
+    ):
+        raise HTTPException(
+            401, "缺少或无效的运维令牌", headers={"WWW-Authenticate": "Bearer"}
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -86,11 +125,12 @@ class ReportRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 # Node interaction (blocking urllib, executed in worker threads)
 # --------------------------------------------------------------------------- #
-def _http_post(url: str, payload: dict, timeout: float = PUSH_TIMEOUT) -> tuple[int, dict]:
+def _http_post(url: str, payload: dict, timeout: float = PUSH_TIMEOUT,
+               headers: dict[str, str] | None = None) -> tuple[int, dict]:
     req = urlrequest.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
         method="POST",
     )
     try:
@@ -114,17 +154,32 @@ def _http_get(url: str, timeout: float = PUSH_TIMEOUT) -> dict:
 
 
 def push_to_node(node: dict, revision: int, domain: str, addresses: list[str]) -> dict:
-    """Push one revision to one node. A 409 means it already has newer data."""
+    """Push one revision to one node, signed with that node's key.
+
+    The signature binds purpose "publish", the node identity, the revision
+    and the complete address set, and carries a timestamp + nonce, so a
+    forged, expired, cross-node or replayed push is rejected by the node.
+    A 409 means the node rejected the revision itself (stale/conflicting).
+    """
+    key = NODE_KEYS.get(node["id"])
+    if not key:
+        return {"ok": False, "status": "no-node-key",
+                "detail": f"管理端未配置节点 {node['id']} 的密钥（NODE_KEYS）"}
+    sig_headers = sigauth.publish_headers(
+        key, node["id"], revision, domain, addresses
+    )
     try:
         code, body = _http_post(
             f"{node['control_url'].rstrip('/')}/publish",
             {"revision": revision, "domain": domain, "addresses": addresses},
+            headers=sig_headers,
         )
     except ConnectionError as exc:
         return {"ok": False, "status": "unreachable", "detail": str(exc)}
 
     if code == 200:
-        return {"ok": True, "status": "applied",
+        # "applied" 或 "already-applied"（同修订同内容的幂等确认）都算成功。
+        return {"ok": True, "status": body.get("status", "applied"),
                 "served_revision": body.get("served_revision", revision)}
     if code == 409:
         # Stale push rejected — fetch the node's real served revision so the
@@ -222,6 +277,11 @@ async def lifespan(app: FastAPI):
     db.init_db()
     with db.get_conn() as conn:
         db.ensure_expected_nodes(conn, NODE_IDS)
+    if not OPS_TOKEN:
+        print("[mgmt] WARNING: OPS_TOKEN 未配置，/publishes 与 /reconcile 将拒绝服务")
+    missing = [n for n in NODE_IDS if not NODE_KEYS.get(n)]
+    if missing:
+        print(f"[mgmt] WARNING: 以下节点未配置密钥（NODE_KEYS），下发与回传都将失败: {missing}")
     task = asyncio.create_task(reconciler_loop())
     yield
     task.cancel()
@@ -235,7 +295,8 @@ app = FastAPI(
 )
 
 
-@app.post("/publishes", status_code=201, summary="提交新的地址列表（生成新修订）")
+@app.post("/publishes", status_code=201, summary="提交新的地址列表（生成新修订）",
+          dependencies=[Depends(require_ops_token)])
 async def create_publish(req: PublishRequest, background: BackgroundTasks) -> dict:
     # BEGIN IMMEDIATE serialises concurrent submissions; revisions stay
     # strictly increasing even under parallel POSTs.
@@ -350,7 +411,8 @@ async def verify() -> dict:
     }
 
 
-@app.post("/reconcile", summary="手动触发一次对账下发")
+@app.post("/reconcile", summary="手动触发一次对账下发",
+          dependencies=[Depends(require_ops_token)])
 async def manual_reconcile() -> dict:
     return await reconcile_once()
 
@@ -358,10 +420,42 @@ async def manual_reconcile() -> dict:
 # --------------------------------------------------------------------------- #
 # Internal endpoints used by the DNS nodes themselves
 # --------------------------------------------------------------------------- #
-@app.post("/internal/nodes/{node_id}/heartbeat")
-async def heartbeat(node_id: str, req: ReportRequest) -> dict:
+def _verify_node_callback(request: Request, node_id: str, purpose: str,
+                          served_revision: int) -> None:
+    """校验节点回传的 HMAC 签名（身份、用途、时效、防重放）。
+
+    未签名、签名错误、过期、跨节点复用或重放的回调在这里被直接拒绝，
+    不会触碰任何节点状态，因此无法伪造在线状态或已服务版本。
+    """
     if node_id not in NODE_IDS:
         raise HTTPException(404, "unknown node")
+    key = NODE_KEYS.get(node_id)
+    if not key:
+        raise HTTPException(401, f"节点 {node_id} 未配置密钥")
+    hdr = request.headers
+    try:
+        hdr_node = hdr[sigauth.HEADER_NODE]
+        ts = int(hdr[sigauth.HEADER_TS])
+        nonce = hdr[sigauth.HEADER_NONCE]
+        signature = hdr[sigauth.HEADER_SIGNATURE]
+    except (KeyError, ValueError):
+        raise HTTPException(401, "缺少签名头或格式错误")
+    try:
+        sigauth.verify_report_signature(
+            key, purpose, node_id, hdr_node, ts, nonce, signature,
+            served_revision, SIG_TTL,
+        )
+    except sigauth.AuthError as exc:
+        raise HTTPException(401, str(exc))
+    with db.get_conn() as conn:
+        if not sigauth.consume_nonce(conn, purpose, nonce, ts, SIG_TTL):
+            raise HTTPException(409, "重放请求被拒绝（nonce 已消费）")
+
+
+@app.post("/internal/nodes/{node_id}/heartbeat")
+async def heartbeat(node_id: str, req: ReportRequest, request: Request) -> dict:
+    _verify_node_callback(request, node_id, sigauth.PURPOSE_HEARTBEAT,
+                          req.served_revision)
     with db.get_conn() as conn:
         db.upsert_node_heartbeat(conn, node_id)
         db.report_served(conn, node_id, req.served_revision)
@@ -369,8 +463,8 @@ async def heartbeat(node_id: str, req: ReportRequest) -> dict:
 
 
 @app.post("/internal/nodes/{node_id}/report")
-async def report(node_id: str, req: ReportRequest) -> dict:
-    if node_id not in NODE_IDS:
-        raise HTTPException(404, "unknown node")
+async def report(node_id: str, req: ReportRequest, request: Request) -> dict:
+    _verify_node_callback(request, node_id, sigauth.PURPOSE_REPORT,
+                          req.served_revision)
     _record_served(node_id, req.served_revision)
     return {"ok": True}
